@@ -3,7 +3,7 @@
 This script route all from the LAN network to the AmneziaWG server.\
 Tested with firmware Version: 1.1.16
 
-1. Install [AmneziaWG](https://amnezia.org/ru/self-hosted) onto your VPS.
+1. Install [AmneziaWG](https://amnezia.org/ru/self-hosted) onto your VPS. Or buy premium from https://amnezia.org/en/premium
 2. Connect to your brand new AmneziaWG server using the Amnezia client.
 3. In the client create a new connection for your router, and save the config in _AmneziaWG native format_. It is supposed that the name of the file will be `amnezia_for_awg.conf`.
 4. [Enable SSH](https://github.com/openwrt-xiaomi/xmir-patcher) on your router.
