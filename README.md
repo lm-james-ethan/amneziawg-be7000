@@ -13,7 +13,7 @@ Tested with firmware Version: 1.1.16
 8. Make the downloaded script executable: `chmod +x /data/usr/app/awg/amneziawg-go` and `chmod +x /data/usr/app/awg/awg ` and `chmod +x /data/usr/app/awg/clear_firewall_settings.sh` and `chmod +x /data/usr/app/awg/awg_route_switch.sh` and `chmod +x /data/usr/app/awg/awg_watchdog.sh`
 9. Run the script: `./awg_route_switch.sh up`
 10. Now, the LAN network should be connected to your AmneziaWG server before the router reboots.
-11. for auto reconnect awg0 `crontab -e` and add `* * * * * /bin/sh /data/usr/app/awg/awg_watchdog.sh >> /tmp/awg_watchdog.log 2>&1` save and exit and `/etc/init.d/cron restart`
+11. if you don't need can skip for auto reconnect awg0 `crontab -e` and add `* * * * * /bin/sh /data/usr/app/awg/awg_watchdog.sh >> /tmp/awg_watchdog.log 2>&1` save and exit and `/etc/init.d/cron restart`
 12. Thanks for https://github.com/alexandershalin/
 
 
