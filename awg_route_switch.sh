@@ -28,9 +28,10 @@ root; need "$CFG"
 ##############################################################################
 # Parse static info from Amnezia config
 ##############################################################################
-WG_SERVER=$(awk -F' = ' '/^Endpoint/ {print $2}' "$CFG" | cut -d':' -f1)
-WG_ADDR=$(awk   -F' = ' '/^Address/  {print $2}' "$CFG")
-DNS=$(awk       -F' = ' '/^DNS/      {print $2}' "$CFG" | cut -d',' -f1)
+# We add 'tr -d '\r'' to ensure NO hidden DOS carriage returns break the variables
+WG_SERVER=$(awk -F' = ' '/^Endpoint/ {print $2}' "$CFG" | cut -d':' -f1 | tr -d '\r')
+WG_ADDR=$(awk   -F' = ' '/^Address/  {print $2}' "$CFG" | cut -d',' -f1 | tr -d '\r')
+DNS=$(awk       -F' = ' '/^DNS/      {print $2}' "$CFG" | cut -d',' -f1 | tr -d '\r')
 
 ##############################################################################
 # Helper – create stripped awg0.conf
