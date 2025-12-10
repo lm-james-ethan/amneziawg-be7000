@@ -3,6 +3,11 @@
 
 # ================= CONFIGURATION =================
 CFG_FILE="amnezia_for_awg.conf"
+
+# --- DNS NAT SETTINGS ---
+ENABLE_DNS_NAT=1             # Set to 1 to enable DNS redirection
+VPN_DNS="1.1.1.1"            # The DNS server to force (Cloudflare, Google, or VPN internal)
+LAN_NET="192.168.0.0/16"     # Your LAN range (covers 192.168.1.x, 31.x, etc.)
 # =================================================
 
 DIR="/data/usr/app/awg"
@@ -21,7 +26,6 @@ get_wan_info() {
     fi
 
     # 2. If state is empty/invalid, try to detect from current routing table
-    # (Look for the route used to reach 1.1.1.1 or 8.8.8.8)
     if [ -z "$WAN_GW" ]; then
         ROUTE_INFO=$(ip route get 1.1.1.1 2>/dev/null | head -n 1)
         WAN_GW=$(echo "$ROUTE_INFO" | awk '{ for(i=1; i<=NF; i++) if ($i=="via") print $(i+1) }')
@@ -81,12 +85,24 @@ do_up() {
     fi
 
     # 4. FIREWALL: Fix if wiped
+    # A. VPN Masquerade
     iptables -t nat -C POSTROUTING -o awg0 -j MASQUERADE 2>/dev/null
     if [ $? -ne 0 ]; then
-        echo " > Applying Firewall Rules..."
+        echo " > Applying Firewall Rules (Forwarding & NAT)..."
         iptables -A FORWARD -i awg0 -j ACCEPT
         iptables -A FORWARD -o awg0 -j ACCEPT
         iptables -t nat -A POSTROUTING -o awg0 -j MASQUERADE
+    fi
+
+    # B. DNS Redirection (NAT)
+    if [ "$ENABLE_DNS_NAT" = 1 ] && [ -n "$VPN_DNS" ]; then
+        # Check if rule exists to avoid duplicates
+        iptables -t nat -C PREROUTING -p udp -s "$LAN_NET" --dport 53 -j DNAT --to-destination "${VPN_DNS}:53" 2>/dev/null
+        if [ $? -ne 0 ]; then
+            echo " > Enabling DNS Redirection to $VPN_DNS..."
+            iptables -t nat -A PREROUTING -p udp -s "$LAN_NET" --dport 53 -j DNAT --to-destination "${VPN_DNS}:53"
+            iptables -t nat -A PREROUTING -p tcp -s "$LAN_NET" --dport 53 -j DNAT --to-destination "${VPN_DNS}:53"
+        fi
     fi
 }
 
@@ -116,9 +132,16 @@ do_down() {
     fi
 
     # 3. Remove Firewall Rules
+    echo " > Removing Firewall Rules..."
     iptables -D FORWARD -i awg0 -j ACCEPT 2>/dev/null
     iptables -D FORWARD -o awg0 -j ACCEPT 2>/dev/null
     iptables -t nat -D POSTROUTING -o awg0 -j MASQUERADE 2>/dev/null
+
+    # Remove DNS NAT Rules
+    if [ -n "$VPN_DNS" ]; then
+        iptables -t nat -D PREROUTING -p udp -s "$LAN_NET" --dport 53 -j DNAT --to-destination "${VPN_DNS}:53" 2>/dev/null
+        iptables -t nat -D PREROUTING -p tcp -s "$LAN_NET" --dport 53 -j DNAT --to-destination "${VPN_DNS}:53" 2>/dev/null
+    fi
 
     # 4. Kill Interface
     ip link set down awg0 2>/dev/null
@@ -136,7 +159,10 @@ do_status() {
         ip -brief addr show awg0
         echo ""
         echo "[Firewall NAT]"
-        iptables -t nat -S | grep awg0 || echo "MISSING!"
+        iptables -t nat -S | grep awg0 || echo "VPN NAT MISSING!"
+        echo ""
+        echo "[DNS NAT]"
+        iptables -t nat -S | grep "dport 53" | grep DNAT && echo "DNS Redirection ACTIVE" || echo "DNS Redirection INACTIVE"
         echo ""
         echo "[Ping Test]"
         ping -c 2 -W 2 -I awg0 1.1.1.1 2>/dev/null | grep "ttl=" || echo "Ping Failed"
