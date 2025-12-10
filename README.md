@@ -17,6 +17,15 @@ Tested with firmware Version: 1.1.16
 12. Thanks for https://github.com/alexandershalin/
 
 
+Second Method it working when router is reboot 
+chmod +x /data/usr/app/awg/setup_firewall.sh
+/data/usr/app/awg/setup_firewall.sh up
+chmod +x /data/usr/app/awg/awg_start.sh
+/data/usr/app/awg/awg_start.sh up and down and status 
+
+
+
+
 Binaries built from official sources: https://github.com/amnezia-vpn/
 
 Useful links:
