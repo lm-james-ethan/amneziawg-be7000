@@ -1,179 +1,183 @@
 #!/bin/sh
-# /data/usr/app/awg/awg_start.sh
+# AmneziaWG Toggle Script - Dynamic Config Version
 
-# ================= CONFIGURATION =================
-CFG_FILE="amnezia_for_awg.conf"
+# --- Configuration ---
+AWG_DIR="/data/usr/app/awg"
+CFG="$AWG_DIR/amnezia_for_awg.conf"
+IFCFG="$AWG_DIR/awg0.conf"
+TOOLS_BIN="$AWG_DIR/awg"
+AWG_GO="$AWG_DIR/amneziawg-go"
+WATCHDOG_SCRIPT="$AWG_DIR/awg_watchdog.sh"
+LAN_NET="192.168.31.0/24"
+LAN_BR="br-lan"
+STATE_FILE="/tmp/awg_wan_state"
 
-# --- DNS NAT SETTINGS ---
-ENABLE_DNS_NAT=1             # Set to 1 to enable DNS redirection
-VPN_DNS="1.1.1.1"            # The DNS server to force (Cloudflare, Google, or VPN internal)
-LAN_NET="192.168.0.0/16"     # Your LAN range (covers 192.168.1.x, 31.x, etc.)
-# =================================================
+die()   { echo "Error: $*" >&2; exit 1; }
+root()  { [ "$(id -u)" -eq 0 ] || die "Run as root"; }
 
-DIR="/data/usr/app/awg"
-CFG="$DIR/$CFG_FILE"
-IFCFG="$DIR/awg0.conf"
-WG_BIN="$DIR/amneziawg-go"
-TOOLS_BIN="$DIR/awg"
-STATE_FILE="/tmp/awg_wan_gw"  # File to remember the real Gateway
+# --- Helper: Detect and Save WAN Gateway ---
+save_wan_info() {
+    ROUTE_INFO=$(ip route get 1.1.1.1 2>/dev/null | head -n 1)
+    GW=$(echo "$ROUTE_INFO" | awk '{ for(i=1; i<=NF; i++) if ($i=="via") print $(i+1) }')
+    IF=$(echo "$ROUTE_INFO" | awk '{ for(i=1; i<=NF; i++) if ($i=="dev") print $(i+1) }')
 
-# --- Helper: Find Gateway ---
-get_wan_info() {
-    # 1. Try to read from saved state first
+    if [ "$IF" = "awg0" ]; then
+        echo "Detected awg0 as WAN. VPN is likely already up. Skipping save."
+        return 1
+    fi
+
+    if [ -n "$GW" ] && [ -n "$IF" ]; then
+        echo "$GW $IF" > "$STATE_FILE"
+        echo "Saved WAN State: Gateway $GW on $IF"
+        return 0
+    else
+        echo "Failed to detect WAN gateway!"
+        return 1
+    fi
+}
+
+get_saved_wan() {
     if [ -f "$STATE_FILE" ]; then
-        WAN_GW=$(cat "$STATE_FILE" | awk '{print $1}')
-        WAN_IF=$(cat "$STATE_FILE" | awk '{print $2}')
-    fi
-
-    # 2. If state is empty/invalid, try to detect from current routing table
-    if [ -z "$WAN_GW" ]; then
-        ROUTE_INFO=$(ip route get 1.1.1.1 2>/dev/null | head -n 1)
-        WAN_GW=$(echo "$ROUTE_INFO" | awk '{ for(i=1; i<=NF; i++) if ($i=="via") print $(i+1) }')
-        WAN_IF=$(echo "$ROUTE_INFO" | awk '{ for(i=1; i<=NF; i++) if ($i=="dev") print $(i+1) }')
-    fi
-}
-
-# --- ACTION: UP (Start/Fix) ---
-do_up() {
-    echo "--- Checking/Starting VPN ---"
-    
-    # 1. CRON: Ensure Watchdog is active
-    if ! crontab -l 2>/dev/null | grep -q "awg_start.sh"; then
-        echo " > Adding Watchdog to Cron..."
-        (crontab -l 2>/dev/null; echo "* * * * * /data/usr/app/awg/awg_start.sh up") | crontab -
-    fi
-
-    # 2. INTERFACE: Start if missing
-    if ! ip link show awg0 >/dev/null 2>&1; then
-        echo " > Starting Interface..."
-        
-        # Save current WAN Gateway BEFORE we mess up the routing
-        get_wan_info
-        if [ -n "$WAN_GW" ] && [ -n "$WAN_IF" ]; then
-            echo "$WAN_GW $WAN_IF" > "$STATE_FILE"
-        fi
-
-        # Prepare Config
-        WG_ADDR=$(awk -F' = ' '/^Address/ {print $2}' "$CFG" | cut -d',' -f1 | tr -d '\r')
-        awk '!/^Address/ && !/^DNS/' "$CFG" > "$IFCFG"
-
-        killall amneziawg-go 2>/dev/null
-        export WG_I_PREFER_BUGGY_USERSPACE_TO_POLISHED_KERNEL=1
-        "$WG_BIN" awg0
-        sleep 2
-        "$TOOLS_BIN" setconf awg0 "$IFCFG"
-        ip link set dev awg0 mtu 1280
-        ip addr add "$WG_ADDR" dev awg0
-        ip link set up awg0
-    fi
-
-    # 3. ROUTING: Fix if broken
-    get_wan_info
-    if [ -n "$WAN_GW" ]; then
-        WG_SERVER=$(awk -F' = ' '/^Endpoint/ {print $2}' "$CFG" | cut -d':' -f1 | tr -d '\r')
-        
-        # Ensure VPN Server uses real Internet (Lock the tunnel)
-        ip route add "$WG_SERVER"/32 via "$WAN_GW" dev "$WAN_IF" 2>/dev/null
-        
-        # Ensure Default Traffic uses VPN
-        CURRENT_DEF=$(ip route show default | awk '{print $5}' | head -n 1)
-        if [ "$CURRENT_DEF" != "awg0" ]; then
-            echo " > Switching Default Route to VPN..."
-            ip route del default
-            ip route add default dev awg0
-        fi
-    fi
-
-    # 4. FIREWALL: Fix if wiped
-    # A. VPN Masquerade
-    iptables -t nat -C POSTROUTING -o awg0 -j MASQUERADE 2>/dev/null
-    if [ $? -ne 0 ]; then
-        echo " > Applying Firewall Rules (Forwarding & NAT)..."
-        iptables -A FORWARD -i awg0 -j ACCEPT
-        iptables -A FORWARD -o awg0 -j ACCEPT
-        iptables -t nat -A POSTROUTING -o awg0 -j MASQUERADE
-    fi
-
-    # B. DNS Redirection (NAT)
-    if [ "$ENABLE_DNS_NAT" = 1 ] && [ -n "$VPN_DNS" ]; then
-        # Check if rule exists to avoid duplicates
-        iptables -t nat -C PREROUTING -p udp -s "$LAN_NET" --dport 53 -j DNAT --to-destination "${VPN_DNS}:53" 2>/dev/null
-        if [ $? -ne 0 ]; then
-            echo " > Enabling DNS Redirection to $VPN_DNS..."
-            iptables -t nat -A PREROUTING -p udp -s "$LAN_NET" --dport 53 -j DNAT --to-destination "${VPN_DNS}:53"
-            iptables -t nat -A PREROUTING -p tcp -s "$LAN_NET" --dport 53 -j DNAT --to-destination "${VPN_DNS}:53"
-        fi
-    fi
-}
-
-# --- ACTION: DOWN (Stop) ---
-do_down() {
-    echo "--- Stopping VPN ---"
-    
-    # 1. Remove Cron
-    crontab -l 2>/dev/null | grep -v "awg_start.sh" | crontab -
-    
-    # 2. Restore Routing (CRITICAL FIX)
-    get_wan_info
-    
-    # Delete VPN route
-    ip route del default dev awg0 2>/dev/null
-    
-    # Restore WAN route
-    if [ -n "$WAN_GW" ] && [ -n "$WAN_IF" ]; then
-        echo " > Restoring WAN: via $WAN_GW dev $WAN_IF"
-        ip route add default via "$WAN_GW" dev "$WAN_IF" 2>/dev/null
-        
-        # Remove the locked route for the server
-        WG_SERVER=$(awk -F' = ' '/^Endpoint/ {print $2}' "$CFG" | cut -d':' -f1 | tr -d '\r')
-        ip route del "$WG_SERVER"/32 2>/dev/null
+        WAN_GW=$(awk '{print $1}' "$STATE_FILE")
+        WAN_IF=$(awk '{print $2}' "$STATE_FILE")
     else
-        echo " ! WARNING: Could not find original Gateway. You may need to reboot."
+        return 1
     fi
-
-    # 3. Remove Firewall Rules
-    echo " > Removing Firewall Rules..."
-    iptables -D FORWARD -i awg0 -j ACCEPT 2>/dev/null
-    iptables -D FORWARD -o awg0 -j ACCEPT 2>/dev/null
-    iptables -t nat -D POSTROUTING -o awg0 -j MASQUERADE 2>/dev/null
-
-    # Remove DNS NAT Rules
-    if [ -n "$VPN_DNS" ]; then
-        iptables -t nat -D PREROUTING -p udp -s "$LAN_NET" --dport 53 -j DNAT --to-destination "${VPN_DNS}:53" 2>/dev/null
-        iptables -t nat -D PREROUTING -p tcp -s "$LAN_NET" --dport 53 -j DNAT --to-destination "${VPN_DNS}:53" 2>/dev/null
-    fi
-
-    # 4. Kill Interface
-    ip link set down awg0 2>/dev/null
-    ip link del awg0 2>/dev/null
-    killall amneziawg-go 2>/dev/null
-    rm -f "$STATE_FILE"
-    echo "VPN Stopped."
 }
 
-# --- ACTION: STATUS ---
-do_status() {
-    echo "=== VPN STATUS ==="
+apply_fw() {
+    iptables -C FORWARD -i "$LAN_BR" -o awg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$LAN_BR" -o awg0 -j ACCEPT
+    iptables -C FORWARD -i awg0 -o "$LAN_BR" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i awg0 -o "$LAN_BR" -j ACCEPT
+    iptables -C INPUT -i awg0 -j ACCEPT 2>/dev/null || iptables -A INPUT -i awg0 -j ACCEPT
+    iptables -t nat -C POSTROUTING -s "$LAN_NET" -o awg0 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s "$LAN_NET" -o awg0 -j MASQUERADE
+}
+
+remove_fw() {
+    iptables -D FORWARD -i "$LAN_BR" -o awg0 -j ACCEPT 2>/dev/null
+    iptables -D FORWARD -i awg0 -o "$LAN_BR" -j ACCEPT 2>/dev/null
+    iptables -D INPUT -i awg0 -j ACCEPT 2>/dev/null
+    iptables -t nat -D POSTROUTING -s "$LAN_NET" -o awg0 -j MASQUERADE 2>/dev/null
+}
+
+cron_add() {
+    [ ! -f "$WATCHDOG_SCRIPT" ] && return
+    CRON_CMD="* * * * * sh $WATCHDOG_SCRIPT > /dev/null 2>&1"
+    if ! crontab -l 2>/dev/null | grep -qF "awg_watchdog.sh"; then
+        (crontab -l 2>/dev/null; echo "$CRON_CMD") | crontab -
+    fi
+}
+
+cron_del() {
+    if crontab -l 2>/dev/null | grep -qF "awg_watchdog.sh"; then
+        crontab -l 2>/dev/null | grep -vF "awg_watchdog.sh" | crontab -
+    fi
+}
+
+up() {
+    root
     if ip link show awg0 >/dev/null 2>&1; then
-        echo "[Interface] UP"
-        ip -brief addr show awg0
-        echo ""
-        echo "[Firewall NAT]"
-        iptables -t nat -S | grep awg0 || echo "VPN NAT MISSING!"
-        echo ""
-        echo "[DNS NAT]"
-        iptables -t nat -S | grep "dport 53" | grep DNAT && echo "DNS Redirection ACTIVE" || echo "DNS Redirection INACTIVE"
-        echo ""
-        echo "[Ping Test]"
-        ping -c 2 -W 2 -I awg0 1.1.1.1 2>/dev/null | grep "ttl=" || echo "Ping Failed"
+        echo "VPN is already UP."
+        status
+        exit 0
+    fi
+
+    echo "Starting VPN..."
+
+    # --- Config Parsing ---
+    WG_SERVER=$(grep "^Endpoint" "$CFG" | sed 's/.*= *//' | cut -d':' -f1 | tr -d '\r')
+    
+    # User Logic: Extract Address and Clean Config
+    WG_ADDR=$(awk -F' = ' '/^Address/ {print $2}' "$CFG" | cut -d',' -f1 | tr -d '\r')
+    awk '!/^Address/ && !/^DNS/' "$CFG" > "$IFCFG"
+    
+    [ -z "$WG_SERVER" ] || [ -z "$WG_ADDR" ] && die "Invalid config"
+
+    save_wan_info || die "Could not detect WAN Gateway. Aborting."
+    get_saved_wan 
+
+    echo "Target Server: $WG_SERVER"
+    echo "Routing via: $WAN_GW ($WAN_IF)"
+
+    pkill -f amneziawg-go 2>/dev/null
+    [ -d /dev/net ] || mkdir -p /dev/net
+    [ -c /dev/net/tun ] || mknod /dev/net/tun c 10 200
+    
+    export WG_I_PREFER_BUGGY_USERSPACE_TO_POLISHED_KMOD=1
+    $AWG_GO awg0 >/dev/null 2>&1 &
+    
+    count=0
+    while ! ip link show awg0 >/dev/null 2>&1; do
+        sleep 0.5
+        count=$((count+1))
+        [ $count -ge 10 ] && die "awg0 failed to create interface."
+    done
+
+    ip addr flush dev awg0 2>/dev/null
+    ip addr add "$WG_ADDR" dev awg0
+    "$TOOLS_BIN" setconf awg0 "$IFCFG"
+    ip link set up awg0
+    ip link set mtu 1280 dev awg0
+
+    ip route add "$WG_SERVER"/32 via "$WAN_GW" dev "$WAN_IF"
+    ip route del default 2>/dev/null
+    ip route add default dev awg0
+
+    remove_fw
+    apply_fw
+    ip route flush cache
+    cron_add
+    /etc/init.d/firewall reload
+
+    echo "VPN IS UP"
+    echo -n "Public IP: "
+    curl -s --max-time 5 ifconfig.me || echo "Check manually"
+    echo
+}
+
+down() {
+    echo "Stopping VPN..."
+    root
+    get_saved_wan 
+    WG_SERVER=$(grep "^Endpoint" "$CFG" | sed 's/.*= *//' | cut -d':' -f1 | tr -d '\r')
+
+    ip route del default dev awg0 2>/dev/null
+    [ -n "$WG_SERVER" ] && ip route del "$WG_SERVER"/32 2>/dev/null
+    
+    if [ -n "$WAN_GW" ]; then
+        echo "Restoring default route to $WAN_GW..."
+        ip route del default 2>/dev/null
+        ip route add default via "$WAN_GW" dev "$WAN_IF" 2>/dev/null
     else
-        echo "[Interface] DOWN"
+        echo "Warning: No saved gateway. Restoring network..."
+        /etc/init.d/network restart
+    fi
+
+    remove_fw
+    [ -x "$(command -v conntrack)" ] && conntrack -F >/dev/null 2>&1
+    
+    ip link del awg0 2>/dev/null
+    pkill -f amneziawg-go 2>/dev/null
+    rm -f "$STATE_FILE" "$IFCFG" 2>/dev/null
+    cron_del
+    /etc/init.d/firewall reload
+
+    echo "VPN IS DOWN"
+}
+
+status() {
+    if ip link show awg0 >/dev/null 2>&1; then
+        echo "VPN Status: [CONNECTED]"
+        echo "Interface: awg0"
+        echo "Uplink: $(ip route show default | grep awg0)"
+    else
+        echo "VPN Status: [DISCONNECTED]"
     fi
 }
 
-# --- MAIN LOGIC ---
 case "$1" in
-    down)   do_down ;;
-    status) do_status ;;
-    up|*)   do_up ;;
+    up) up ;;
+    down) down ;;
+    status) status ;;
+    restart) down; sleep 2; up ;;
+    *) echo "Usage: $0 {up|down|status|restart}" ;;
 esac
