@@ -1,29 +1,26 @@
 #!/bin/sh
 
-# Configuration
+# IP to ping to check for a live connection.
 CHECK_IP="1.1.1.1"
-# Points to the main switch script
-SWITCH_SCRIPT="/data/usr/app/awg/awg_route_switch.sh"
+SETUP_SCRIPT="/data/usr/app/awg/vpn.sh"
 
-# 1. Check if we intend to be online
-# If the state file doesn't exist, the user probably ran 'down', so we shouldn't intervene.
-if [ ! -f "/tmp/awg_wan_info" ]; then
-    exit 0
-fi
-
-# 2. Check Interface existence
+# Check if the awg0 interface exists. If not, the connection is definitely down.
 if ! ip link show awg0 > /dev/null 2>&1; then
-    logger -t awg_watchdog "Interface awg0 missing. Restarting..."
-    sh "$SWITCH_SCRIPT" down
-    sh "$SWITCH_SCRIPT" up
+    logger -t awg_watchdog "Interface awg0 not found. Restarting connection."
+    $SETUP_SCRIPT up
     exit 0
 fi
 
-# 3. Check Connectivity (Ping)
-# -c 1: One packet
-# -W 5: Wait 5 seconds
-if ! ping -c 1 -W 5 -I awg0 "$CHECK_IP" > /dev/null 2>&1; then
-    logger -t awg_watchdog "Ping check to $CHECK_IP failed. Restarting VPN..."
-    sh "$SWITCH_SCRIPT" down
-    sh "$SWITCH_SCRIPT" up
+# Ping the check IP through the awg0 interface.
+# -c 1: Send only 1 packet.
+# -W 3: Wait a maximum of 3 seconds for a reply.
+ping -c 3 -W 3 -I awg0 $CHECK_IP > /dev/null 2>&1
+
+# Check the exit code of the ping command. 0 means success.
+if [ $? -ne 0 ]; then
+    logger -t awg_watchdog "Ping check failed. Restarting connection."
+    # The connection is down, run the main setup script to fix it.
+    $SETUP_SCRIPT down 
+    sleep 15
+    $SETUP_SCRIPT up
 fi
