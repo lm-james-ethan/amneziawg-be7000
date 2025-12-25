@@ -1,5 +1,5 @@
 #!/bin/sh
-# AmneziaWG Toggle Script - Static YouTube List Version
+# AmneziaWG Toggle Script - Hybrid Version (Static List + Domain Sniffing)
 
 # --- Configuration ---
 AWG_DIR="/data/usr/app/awg"
@@ -18,6 +18,7 @@ WAN_TABLE="200"
 FW_MARK="0x200"
 YT_URL="https://raw.githubusercontent.com/touhidurrr/iplist-youtube/main/lists/ipv4.txt"
 YT_CACHE="$AWG_DIR/youtube_ipv4.txt"
+DNSMASQ_CONF="/etc/dnsmasq.d/99-youtube.conf"
 
 die()   { echo "Error: $*" >&2; exit 1; }
 root()  { [ "$(id -u)" -eq 0 ] || die "Run as root"; }
@@ -52,33 +53,53 @@ get_saved_wan() {
     fi
 }
 
-# --- NEW: Bulk Load YouTube IPs ---
+# --- 1. Static List Loader ---
 load_youtube_ips() {
     echo "Processing YouTube IP List..."
     
-    # 1. Create IPSet (Maxelem increased to 100000 for large list)
+    # Create IPSet (hash:net handles both subnets and single IPs)
     ipset create "$IPSET_NAME" hash:net maxelem 100000 comment 2>/dev/null || true
     
-    # 2. Download list if not exists or empty (optional: force update with separate command)
+    # Download if missing
     if [ ! -s "$YT_CACHE" ]; then
         echo "Downloading IP list from GitHub..."
         curl -s --connect-timeout 10 "$YT_URL" -o "$YT_CACHE"
     fi
 
     if [ -s "$YT_CACHE" ]; then
-        # 3. Bulk Load using restore (Fastest method)
-        # We use sed to format the file into 'add youtube <IP>' commands
         echo "Loading $(wc -l < "$YT_CACHE") IPs into set..."
-        
-        # Flush old entries to ensure clean state
         ipset flush "$IPSET_NAME"
-        
-        # 'restore -!' ignores errors if duplicates exist
         sed "s/^/add $IPSET_NAME /" "$YT_CACHE" | ipset restore -!
-        
-        echo "YouTube IP List Loaded."
+        echo "Static IP List Loaded."
     else
         echo "Warning: Could not find or download YouTube IP list."
+    fi
+}
+
+# --- 2. Dynamic Domain Loader (Dnsmasq) ---
+setup_dnsmasq() {
+    echo "Configuring Dnsmasq for YouTube domains..."
+    
+    # Create the config file
+    [ -d /etc/dnsmasq.d ] || mkdir -p /etc/dnsmasq.d
+    cat <<EOF > "$DNSMASQ_CONF"
+ipset=/youtube.com/$IPSET_NAME
+ipset=/googlevideo.com/$IPSET_NAME
+ipset=/ytimg.com/$IPSET_NAME
+ipset=/youtu.be/$IPSET_NAME
+ipset=/google.com/$IPSET_NAME
+ipset=/googleapis.com/$IPSET_NAME
+ipset=/video.google.com/$IPSET_NAME
+EOF
+
+    # Restart Dnsmasq to apply
+    /etc/init.d/dnsmasq restart
+}
+
+remove_dnsmasq() {
+    if [ -f "$DNSMASQ_CONF" ]; then
+        rm -f "$DNSMASQ_CONF"
+        /etc/init.d/dnsmasq restart
     fi
 }
 
@@ -90,14 +111,12 @@ apply_fw() {
     iptables -t nat -C POSTROUTING -s "$LAN_NET" -o awg0 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s "$LAN_NET" -o awg0 -j MASQUERADE
 
     # --- Policy Routing ---
-    # Ensure IPSet exists even if download failed
+    # Ensure set exists (in case load_ips failed)
     ipset create "$IPSET_NAME" hash:net maxelem 100000 comment 2>/dev/null || true
 
-    # Routing Table
     ip route flush table "$WAN_TABLE"
     ip route add default via "$WAN_GW" dev "$WAN_IF" table "$WAN_TABLE"
 
-    # IP Rules
     ip rule del fwmark "$FW_MARK" table "$WAN_TABLE" 2>/dev/null
     ip rule add fwmark "$FW_MARK" table "$WAN_TABLE"
 
@@ -122,8 +141,6 @@ remove_fw() {
     
     ip rule del fwmark "$FW_MARK" table "$WAN_TABLE" 2>/dev/null
     ip route flush table "$WAN_TABLE" 2>/dev/null
-    
-    # We do not flush the ipset on 'down' so the list is ready for next time
 }
 
 cron_add() {
@@ -140,7 +157,6 @@ cron_del() {
     fi
 }
 
-# --- Separate Update Function ---
 update_list() {
     echo "Forcing YouTube List Update..."
     if curl -s --connect-timeout 10 "$YT_URL" -o "$YT_CACHE"; then
@@ -192,8 +208,11 @@ up() {
     ip link set up awg0
     ip link set mtu 1280 dev awg0
 
-    # Load IPs BEFORE switching routes to ensure internet access if needed (though we use WAN)
+    # 1. Load Static IPs
     load_youtube_ips
+    
+    # 2. Configure Domain Sniffing (Dnsmasq)
+    setup_dnsmasq
 
     ip route add "$WG_SERVER"/32 via "$WAN_GW" dev "$WAN_IF"
     ip route del default 2>/dev/null
@@ -231,6 +250,8 @@ down() {
     fi
 
     remove_fw
+    remove_dnsmasq
+    
     [ -x "$(command -v conntrack)" ] && conntrack -F >/dev/null 2>&1
     
     ip link del awg0 2>/dev/null
@@ -246,8 +267,8 @@ status() {
     if ip link show awg0 >/dev/null 2>&1; then
         echo "VPN Status: [CONNECTED]"
         echo "Routing YouTube via: WAN"
-        # Check count of IPs
-        echo "YouTube IP List: $(ipset list youtube | grep "Number of entries" | awk '{print $4}') entries active"
+        COUNT=$(ipset list youtube | grep "Number of entries" | awk '{print $4}')
+        echo "Protected IPs: $COUNT (Static + Dynamic)"
     else
         echo "VPN Status: [DISCONNECTED]"
     fi
