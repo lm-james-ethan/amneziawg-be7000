@@ -1,262 +1,263 @@
 #!/bin/sh
-# awg_route_switch.sh – Toggle “YouTube via WAN, rest via awg0” (state-aware)
+# AmneziaWG Toggle Script - Static YouTube List Version
 
-##############################################################################
-#  USER CONFIG (edit paths only if they differ)
-##############################################################################
+# --- Configuration ---
 AWG_DIR="/data/usr/app/awg"
 CFG="$AWG_DIR/amnezia_for_awg.conf"
 IFCFG="$AWG_DIR/awg0.conf"
-AWG_BIN="$AWG_DIR/awg"
+TOOLS_BIN="$AWG_DIR/awg"
 AWG_GO="$AWG_DIR/amneziawg-go"
-
+WATCHDOG_SCRIPT="$AWG_DIR/awg_watchdog.sh"
 LAN_NET="192.168.31.0/24"
 LAN_BR="br-lan"
-ROUTER_IP="192.168.31.1"
-STATE_FILE="/tmp/awg_wan_info"      # stores WAN_GW  WAN_IF
+STATE_FILE="/tmp/awg_wan_state"
 
-# Enable DNS DNAT? (0 = disable, 1 = enable)
-# Note: If enabled, all DNS goes to WG DNS. Disable if you want YouTube DNS to bypass.
-ENABLE_DNS_NAT=1
-##############################################################################
+# --- Split Routing Config ---
+IPSET_NAME="youtube"
+WAN_TABLE="200"
+FW_MARK="0x200"
+YT_URL="https://raw.githubusercontent.com/touhidurrr/iplist-youtube/main/lists/ipv4.txt"
+YT_CACHE="$AWG_DIR/youtube_ipv4.txt"
 
-die()  { echo "? $*" >&2; exit 1; }
-need() { [ -f "$1" ] || die "Missing file: $1"; }
-root() { [ "$(id -u)" -eq 0 ] || die "Run as root"; }
+die()   { echo "Error: $*" >&2; exit 1; }
+root()  { [ "$(id -u)" -eq 0 ] || die "Run as root"; }
 
-root; need "$CFG"
+# --- Helper: Detect and Save WAN Gateway ---
+save_wan_info() {
+    ROUTE_INFO=$(ip route get 1.1.1.1 2>/dev/null | head -n 1)
+    GW=$(echo "$ROUTE_INFO" | awk '{ for(i=1; i<=NF; i++) if ($i=="via") print $(i+1) }')
+    IF=$(echo "$ROUTE_INFO" | awk '{ for(i=1; i<=NF; i++) if ($i=="dev") print $(i+1) }')
 
-##############################################################################
-# Parse static info from Amnezia config
-##############################################################################
-WG_SERVER=$(awk -F' = ' '/^Endpoint/ {print $2}' "$CFG" | cut -d':' -f1)
-WG_ADDR=$(awk   -F' = ' '/^Address/  {print $2}' "$CFG")
-DNS=$(awk       -F' = ' '/^DNS/      {print $2}' "$CFG" | cut -d',' -f1)
+    if [ "$IF" = "awg0" ]; then
+        echo "Detected awg0 as WAN. VPN is likely already up. Skipping save."
+        return 1
+    fi
 
-##############################################################################
-# Helper – create stripped awg0.conf
-##############################################################################
-build_ifcfg() {
-    if [ ! -f "$IFCFG" ]; then
-        awk '!/^Address/ && !/^DNS/' "$CFG" > "$IFCFG"
-        echo "? Created $IFCFG"
+    if [ -n "$GW" ] && [ -n "$IF" ]; then
+        echo "$GW $IF" > "$STATE_FILE"
+        echo "Saved WAN State: Gateway $GW on $IF"
+        return 0
+    else
+        echo "Failed to detect WAN gateway!"
+        return 1
     fi
 }
 
-##############################################################################
-# Helper – download binaries if missing
-##############################################################################
-ensure_bins() {
-    [ -x "$AWG_BIN" ] && [ -x "$AWG_GO" ] && return
-    echo "Downloading AmneziaWG binaries…"
-    curl -L -o "$AWG_DIR/awg.tar.gz" \
-         https://github.com/alexandershalin/amneziawg-be7000/raw/main/awg.tar.gz  
-    tar -xzvf "$AWG_DIR/awg.tar.gz" -C "$AWG_DIR"
-    chmod +x "$AWG_DIR/"{awg,amneziawg-go}
-    rm "$AWG_DIR/awg.tar.gz"
-}
-
-##############################################################################
-# Helper – bring awg0 up
-##############################################################################
-start_awg() {
-    $AWG_GO awg0 >/dev/null 2>&1
-    $AWG_BIN setconf awg0 "$IFCFG"
-    ip addr flush dev awg0 2>/dev/null
-    ip addr add "$WG_ADDR" dev awg0
-    ip link set up awg0
-}
-
-##############################################################################
-# Helper – detect current default route (returns WAN_GW, WAN_IF)
-##############################################################################
-autodetect_wan() {
-    DEF=$(ip r | awk '/^default/ {print $0; exit}')
-    WAN_GW=$(echo "$DEF" | awk '{print $3}')
-    WAN_IF=$(echo "$DEF" | awk '{print $5}')
-    [ -n "$WAN_GW" ] && [ -n "$WAN_IF" ] || return 1
-    return 0
-}
-
-##############################################################################
-# Helper – save WAN info
-##############################################################################
-save_wan_info() {
-    echo "$WAN_GW $WAN_IF" > "$STATE_FILE"
-}
-
-##############################################################################
-# Helper – load WAN info
-##############################################################################
-load_wan_info() {
+get_saved_wan() {
     if [ -f "$STATE_FILE" ]; then
         WAN_GW=$(awk '{print $1}' "$STATE_FILE")
         WAN_IF=$(awk '{print $2}' "$STATE_FILE")
-    fi
-}
-
-##############################################################################
-# Helper – firewall rules (idempotent)
-##############################################################################
-add_fw() {
-    iptables -C FORWARD -i $LAN_BR -o awg0 -j ACCEPT 2>/dev/null || \
-        iptables -A FORWARD -i $LAN_BR -o awg0 -j ACCEPT
-    iptables -C FORWARD -i awg0 -o $LAN_BR -j ACCEPT 2>/dev/null || \
-        iptables -A FORWARD -i awg0 -o $LAN_BR -j ACCEPT
-    iptables -t nat -C POSTROUTING -s $LAN_NET -o awg0 -j MASQUERADE 2>/dev/null || \
-        iptables -t nat -A POSTROUTING -s $LAN_NET -o awg0 -j MASQUERADE
-
-    if [ "$ENABLE_DNS_NAT" = 1 ]; then
-        iptables -t nat -C PREROUTING -p udp -s $LAN_NET --dport 53 -j DNAT --to-destination ${DNS}:53 2>/dev/null || \
-            iptables -t nat -A PREROUTING -p udp -s $LAN_NET --dport 53 -j DNAT --to-destination ${DNS}:53
-        iptables -t nat -C PREROUTING -p tcp -s $LAN_NET --dport 53 -j DNAT --to-destination ${DNS}:53 2>/dev/null || \
-            iptables -t nat -A PREROUTING -p tcp -s $LAN_NET --dport 53 -j DNAT --to-destination ${DNS}:53
-    fi
-}
-
-flush_dns_nat() {
-    if [ "$ENABLE_DNS_NAT" = 1 ]; then
-        iptables -t nat -D PREROUTING -p udp -s $LAN_NET --dport 53 -j DNAT --to-destination ${DNS}:53 2>/dev/null
-        iptables -t nat -D PREROUTING -p tcp -s $LAN_NET --dport 53 -j DNAT --to-destination ${DNS}:53 2>/dev/null
-    fi
-    iptables -t nat -D POSTROUTING -s $LAN_NET -o awg0 -j MASQUERADE 2>/dev/null
-}
-
-##############################################################################
-# ACTION: up – split routing: YouTube via WAN, rest via awg0
-##############################################################################
-do_up() {
-    echo "=== Enabling split routing: YouTube via WAN, rest via awg0 ==="
-    build_ifcfg
-    ensure_bins
-    start_awg
-
-    # Detect WAN and save for future down
-    autodetect_wan || die "Could not detect WAN default route."
-    save_wan_info
-
-    # Ensure WG server is reachable outside tunnel
-    ip route replace "$WG_SERVER"/32 via "$WAN_GW" dev "$WAN_IF"
-
-    # === Load YouTube CIDRs and route them via WAN ===
-    YOUTUBE_CIDR_FILE="/data/usr/app/awg/cidr4.txt"
-    if [ -f "$YOUTUBE_CIDR_FILE" ]; then
-        echo "Loading YouTube CIDRs from $YOUTUBE_CIDR_FILE..."
-        while IFS= read -r cidr; do
-            # Trim whitespace
-            cidr=$(echo "$cidr" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-            # Skip empty lines and comments
-            [ -z "$cidr" ] && continue
-            echo "$cidr" | grep -qE '^(#|;|$)' && continue
-
-            # Validate CIDR format (basic)
-            if echo "$cidr" | grep -qE '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\/[0-9]{1,2}$'; then
-                echo "Routing $cidr via WAN ($WAN_GW on $WAN_IF)"
-                ip route replace "$cidr" via "$WAN_GW" dev "$WAN_IF" metric 10
-            else
-                echo "Invalid CIDR skipped: $cidr" >&2
-            fi
-        done < "$YOUTUBE_CIDR_FILE"
     else
-        echo "Warning: YouTube CIDR file not found: $YOUTUBE_CIDR_FILE" >&2
+        return 1
     fi
-
-    # === Set default route to awg0 (all other traffic goes through tunnel) ===
-    ip route del default 2>/dev/null
-    ip route add default dev awg0 scope link
-
-    # Keep LAN-to-router local (defensive)
-    ip rule add from $LAN_NET to $ROUTER_IP lookup main pref 100 2>/dev/null || true
-
-    # Apply firewall rules
-    add_fw
-
-    echo "? ✅ Split routing active:"
-    echo "   - YouTube (from cidr4.txt) → via $WAN_IF ($WAN_GW)"
-    echo "   - All other traffic → via awg0"
 }
 
-##############################################################################
-# ACTION: down – restore full WAN default
-##############################################################################
-do_down() {
-    echo "=== Restoring full ISP route (disabling split routing) ==="
-
-    # Attempt to load saved WAN info
-    load_wan_info
-
-    # If file missing, fall back to auto-detect
-    if [ -z "$WAN_GW" ] || [ -z "$WAN_IF" ]; then
-        autodetect_wan || die "No saved WAN info and cannot auto-detect."
+# --- NEW: Bulk Load YouTube IPs ---
+load_youtube_ips() {
+    echo "Processing YouTube IP List..."
+    
+    # 1. Create IPSet (Maxelem increased to 100000 for large list)
+    ipset create "$IPSET_NAME" hash:net maxelem 100000 comment 2>/dev/null || true
+    
+    # 2. Download list if not exists or empty (optional: force update with separate command)
+    if [ ! -s "$YT_CACHE" ]; then
+        echo "Downloading IP list from GitHub..."
+        curl -s --connect-timeout 10 "$YT_URL" -o "$YT_CACHE"
     fi
 
-    # Remove all default routes
-    while ip route | grep -q '^default'; do
-        ip route del default 2>/dev/null || break
+    if [ -s "$YT_CACHE" ]; then
+        # 3. Bulk Load using restore (Fastest method)
+        # We use sed to format the file into 'add youtube <IP>' commands
+        echo "Loading $(wc -l < "$YT_CACHE") IPs into set..."
+        
+        # Flush old entries to ensure clean state
+        ipset flush "$IPSET_NAME"
+        
+        # 'restore -!' ignores errors if duplicates exist
+        sed "s/^/add $IPSET_NAME /" "$YT_CACHE" | ipset restore -!
+        
+        echo "YouTube IP List Loaded."
+    else
+        echo "Warning: Could not find or download YouTube IP list."
+    fi
+}
+
+apply_fw() {
+    # VPN Forwarding
+    iptables -C FORWARD -i "$LAN_BR" -o awg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$LAN_BR" -o awg0 -j ACCEPT
+    iptables -C FORWARD -i awg0 -o "$LAN_BR" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i awg0 -o "$LAN_BR" -j ACCEPT
+    iptables -C INPUT -i awg0 -j ACCEPT 2>/dev/null || iptables -A INPUT -i awg0 -j ACCEPT
+    iptables -t nat -C POSTROUTING -s "$LAN_NET" -o awg0 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s "$LAN_NET" -o awg0 -j MASQUERADE
+
+    # --- Policy Routing ---
+    # Ensure IPSet exists even if download failed
+    ipset create "$IPSET_NAME" hash:net maxelem 100000 comment 2>/dev/null || true
+
+    # Routing Table
+    ip route flush table "$WAN_TABLE"
+    ip route add default via "$WAN_GW" dev "$WAN_IF" table "$WAN_TABLE"
+
+    # IP Rules
+    ip rule del fwmark "$FW_MARK" table "$WAN_TABLE" 2>/dev/null
+    ip rule add fwmark "$FW_MARK" table "$WAN_TABLE"
+
+    # Mark Traffic
+    iptables -t mangle -C PREROUTING -m set --match-set "$IPSET_NAME" dst -j MARK --set-mark "$FW_MARK" 2>/dev/null || \
+    iptables -t mangle -A PREROUTING -m set --match-set "$IPSET_NAME" dst -j MARK --set-mark "$FW_MARK"
+    
+    iptables -t mangle -C OUTPUT -m set --match-set "$IPSET_NAME" dst -j MARK --set-mark "$FW_MARK" 2>/dev/null || \
+    iptables -t mangle -A OUTPUT -m set --match-set "$IPSET_NAME" dst -j MARK --set-mark "$FW_MARK"
+
+    echo "Split routing applied."
+}
+
+remove_fw() {
+    iptables -D FORWARD -i "$LAN_BR" -o awg0 -j ACCEPT 2>/dev/null
+    iptables -D FORWARD -i awg0 -o "$LAN_BR" -j ACCEPT 2>/dev/null
+    iptables -D INPUT -i awg0 -j ACCEPT 2>/dev/null
+    iptables -t nat -D POSTROUTING -s "$LAN_NET" -o awg0 -j MASQUERADE 2>/dev/null
+
+    iptables -t mangle -D PREROUTING -m set --match-set "$IPSET_NAME" dst -j MARK --set-mark "$FW_MARK" 2>/dev/null
+    iptables -t mangle -D OUTPUT -m set --match-set "$IPSET_NAME" dst -j MARK --set-mark "$FW_MARK" 2>/dev/null
+    
+    ip rule del fwmark "$FW_MARK" table "$WAN_TABLE" 2>/dev/null
+    ip route flush table "$WAN_TABLE" 2>/dev/null
+    
+    # We do not flush the ipset on 'down' so the list is ready for next time
+}
+
+cron_add() {
+    [ ! -f "$WATCHDOG_SCRIPT" ] && return
+    CRON_CMD="* * * * * sh $WATCHDOG_SCRIPT > /dev/null 2>&1"
+    if ! crontab -l 2>/dev/null | grep -qF "awg_watchdog.sh"; then
+        (crontab -l 2>/dev/null; echo "$CRON_CMD") | crontab -
+    fi
+}
+
+cron_del() {
+    if crontab -l 2>/dev/null | grep -qF "awg_watchdog.sh"; then
+        crontab -l 2>/dev/null | grep -vF "awg_watchdog.sh" | crontab -
+    fi
+}
+
+# --- Separate Update Function ---
+update_list() {
+    echo "Forcing YouTube List Update..."
+    if curl -s --connect-timeout 10 "$YT_URL" -o "$YT_CACHE"; then
+        echo "Download successful."
+        load_youtube_ips
+    else
+        echo "Download failed!"
+    fi
+}
+
+up() {
+    root
+    if ip link show awg0 >/dev/null 2>&1; then
+        echo "VPN is already UP."
+        status
+        exit 0
+    fi
+
+    echo "Starting VPN..."
+
+    WG_SERVER=$(grep "^Endpoint" "$CFG" | sed 's/.*= *//' | cut -d':' -f1 | tr -d '\r')
+    WG_ADDR=$(awk -F' = ' '/^Address/ {print $2}' "$CFG" | cut -d',' -f1 | tr -d '\r')
+    awk '!/^Address/ && !/^DNS/' "$CFG" > "$IFCFG"
+    
+    [ -z "$WG_SERVER" ] || [ -z "$WG_ADDR" ] && die "Invalid config"
+
+    save_wan_info || die "Could not detect WAN Gateway. Aborting."
+    get_saved_wan 
+
+    echo "Target Server: $WG_SERVER"
+
+    pkill -f amneziawg-go 2>/dev/null
+    [ -d /dev/net ] || mkdir -p /dev/net
+    [ -c /dev/net/tun ] || mknod /dev/net/tun c 10 200
+    
+    export WG_I_PREFER_BUGGY_USERSPACE_TO_POLISHED_KMOD=1
+    $AWG_GO awg0 >/dev/null 2>&1 &
+    
+    count=0
+    while ! ip link show awg0 >/dev/null 2>&1; do
+        sleep 0.5
+        count=$((count+1))
+        [ $count -ge 10 ] && die "awg0 failed to create interface."
     done
 
-    # Remove explicit routes for YouTube (optional: can be skipped, less clean)
-    YOUTUBE_CIDR_FILE="/data/usr/app/awg/cidr4.txt"
-    if [ -f "$YOUTUBE_CIDR_FILE" ]; then
-        while IFS= read -r cidr; do
-            cidr=$(echo "$cidr" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-            [ -z "$cidr" ] && continue
-            echo "$cidr" | grep -qE '^(#|;|$)' && continue
-            ip route del "$cidr" via "$WAN_GW" dev "$WAN_IF" 2>/dev/null || true
-        done < "$YOUTUBE_CIDR_FILE"
-    fi
+    ip addr flush dev awg0 2>/dev/null
+    ip addr add "$WG_ADDR" dev awg0
+    "$TOOLS_BIN" setconf awg0 "$IFCFG"
+    ip link set up awg0
+    ip link set mtu 1280 dev awg0
 
-    # Remove pin to WG server
-    ip route del "$WG_SERVER"/32 via "$WAN_GW" dev "$WAN_IF" 2>/dev/null
+    # Load IPs BEFORE switching routes to ensure internet access if needed (though we use WAN)
+    load_youtube_ips
 
-    # Flush DNS NAT rules
-    flush_dns_nat
+    ip route add "$WG_SERVER"/32 via "$WAN_GW" dev "$WAN_IF"
+    ip route del default 2>/dev/null
+    ip route add default dev awg0
 
-    # Restore original default route
-    ip route add default via "$WAN_GW" dev "$WAN_IF" metric 5
+    remove_fw
+    apply_fw
+    
+    ip route flush cache
+    cron_add
+    /etc/init.d/firewall reload
 
-    # Optionally bring down awg0
-    # ip link set down awg0
-
-    echo "? Default route restored via $WAN_GW on $WAN_IF"
+    echo "VPN IS UP"
+    echo -n "Public IP: "
+    curl -s --max-time 5 ifconfig.me || echo "Check manually"
+    echo
 }
 
-##############################################################################
-# ACTION: status – show quick overview
-##############################################################################
-do_status() {
-    echo "-- default route --"
-    ip r | grep '^default' || echo "(none)"
+down() {
+    echo "Stopping VPN..."
+    root
+    get_saved_wan 
+    WG_SERVER=$(grep "^Endpoint" "$CFG" | sed 's/.*= *//' | cut -d':' -f1 | tr -d '\r')
 
-    echo "-- awg0 address --"
-    ip -brief addr show awg0 || echo "(not up)"
-
-    echo "-- route to WG server ($WG_SERVER) --"
-    ip r | grep "$WG_SERVER" || echo "(no explicit /32 route)"
-
-    echo "-- YouTube CIDR routes (via WAN) --"
-    YOUTUBE_CIDR_FILE="/data/usr/app/awg/cidr4.txt"
-    if [ -f "$YOUTUBE_CIDR_FILE" ]; then
-        head_count=0
-        while IFS= read -r cidr; do
-            cidr=$(echo "$cidr" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-            [ -z "$cidr" ] && continue
-            echo "$cidr" | grep -qE '^(#|;|$)' && continue
-            ip route | grep -q "^$cidr " && echo "✅ $cidr" || echo "⏳ $cidr (not routed)"
-            head_count=$((head_count + 1))
-            [ $head_count -ge 10 ] && echo "... (showing first 10)" && break
-        done < "$YOUTUBE_CIDR_FILE"
+    ip route del default dev awg0 2>/dev/null
+    [ -n "$WG_SERVER" ] && ip route del "$WG_SERVER"/32 2>/dev/null
+    
+    if [ -n "$WAN_GW" ]; then
+        echo "Restoring default route to $WAN_GW..."
+        ip route del default 2>/dev/null
+        ip route add default via "$WAN_GW" dev "$WAN_IF" 2>/dev/null
     else
-        echo "YouTube CIDR file missing: $YOUTUBE_CIDR_FILE"
+        echo "Warning: No saved gateway. Restoring network..."
+        /etc/init.d/network restart
+    fi
+
+    remove_fw
+    [ -x "$(command -v conntrack)" ] && conntrack -F >/dev/null 2>&1
+    
+    ip link del awg0 2>/dev/null
+    pkill -f amneziawg-go 2>/dev/null
+    rm -f "$STATE_FILE" "$IFCFG" 2>/dev/null
+    cron_del
+    /etc/init.d/firewall reload
+
+    echo "VPN IS DOWN"
+}
+
+status() {
+    if ip link show awg0 >/dev/null 2>&1; then
+        echo "VPN Status: [CONNECTED]"
+        echo "Routing YouTube via: WAN"
+        # Check count of IPs
+        echo "YouTube IP List: $(ipset list youtube | grep "Number of entries" | awk '{print $4}') entries active"
+    else
+        echo "VPN Status: [DISCONNECTED]"
     fi
 }
 
-##############################################################################
-# MAIN
-##############################################################################
 case "$1" in
-    up)     do_up ;;
-    down)   do_down ;;
-    status) do_status ;;
-    *)      echo "Usage: $0 {up|down|status}"; exit 1 ;;
+    up) up ;;
+    down) down ;;
+    status) status ;;
+    update) update_list ;;
+    restart) down; sleep 2; up ;;
+    *) echo "Usage: $0 {up|down|status|update|restart}" ;;
 esac
