@@ -40,12 +40,12 @@ need "$CFG1"
 ##############################################################################
 # Tunnel 0
 WG_SERVER0=$(awk -F' = ' '/^Endpoint/ {print $2}' "$CFG0" | cut -d':' -f1 | tr -d '\r')
-WG_ADDR0=$(awk   -F' = ' '/^Address/  {print $2}' "$CFG0" | tr -d '\r')
+WG_ADDR0=$(awk -F' = ' '/^Address/ {print $2}' "$CFG0" | cut -d',' -f1 | tr -d ' \r')
 DNS0=$(awk       -F' = ' '/^DNS/      {print $2}' "$CFG0" | cut -d',' -f1 | tr -d '\r')
 
 # Tunnel 1
 WG_SERVER1=$(awk -F' = ' '/^Endpoint/ {print $2}' "$CFG1" | cut -d':' -f1 | tr -d '\r')
-WG_ADDR1=$(awk   -F' = ' '/^Address/  {print $2}' "$CFG1" | tr -d '\r')
+WG_ADDR1=$(awk -F' = ' '/^Address/ {print $2}' "$CFG1" | cut -d',' -f1 | tr -d ' \r')
 DNS1=$(awk       -F' = ' '/^DNS/      {print $2}' "$CFG1" | cut -d',' -f1 | tr -d '\r')
 
 [ -z "$WG_SERVER0" ] && die "Could not parse Endpoint from $CFG0"
@@ -283,4 +283,3 @@ case "$1" in
     status) do_status ;;
     *)      echo "Usage: $0 {up|down|status}"; exit 1 ;;
 esac
-
