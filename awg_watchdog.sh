@@ -2,7 +2,7 @@
 
 # IP to ping to check for a live connection.
 CHECK_IP="1.1.1.1"
-SETUP_SCRIPT="/data/usr/app/awg/vpn.sh"
+SETUP_SCRIPT="/data/usr/app/awg/awg_start.sh"
 
 # Check if the awg0 interface exists. If not, the connection is definitely down.
 if ! ip link show awg0 > /dev/null 2>&1; then
@@ -20,7 +20,5 @@ ping -c 3 -W 3 -I awg0 $CHECK_IP > /dev/null 2>&1
 if [ $? -ne 0 ]; then
     logger -t awg_watchdog "Ping check failed. Restarting connection."
     # The connection is down, run the main setup script to fix it.
-    $SETUP_SCRIPT down 
-    sleep 15
-    $SETUP_SCRIPT up
+    $SETUP_SCRIPT restart
 fi
