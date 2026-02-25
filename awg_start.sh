@@ -53,8 +53,17 @@ get_saved_wan() {
 
 # --- Main Commands ---
 up() {
-    root
-    [ -d "/sys/class/net/awg0" ] && die "VPN is already UP."
+root
+root
+    if [ -d "/sys/class/net/awg0" ]; then
+        echo "VPN is already up. Restarting for you..."
+        down
+        sleep 1
+    fi
+
+ 
+
+
 
     echo "Starting AmneziaWG..."
     WG_SERVER=$(grep "^Endpoint" "$CFG" | sed 's/.*= *//' | cut -d':' -f1 | tr -d '\r ')
